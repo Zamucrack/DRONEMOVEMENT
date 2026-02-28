@@ -1,0 +1,272 @@
+%% DRONE PARK MAP + ZIGZAG + DRONE + MEASUREMENT + WIND + PI CONTROL (STABLE)
+% Full working script (copy/paste)
+clear; clc; close all;
+%% ====== PARAMETERS (modifiable) ======
+parkSize_km   = 50;     % Park size: 50 km x 50 km
+gridSize_km   = 1;      % Grid cell size (1 km default). Change to 0.5, 2, etc.
+showGrid      = true;   % Turn grid lines ON/OFF
+showCellTicks = true;   % Show tick marks at grid boundaries (can clutter if grid is small)
+%% ====== FIGURE SETUP ======
+fig = figure('Color','w','Name','Drone Park Map','NumberTitle','off');
+ax = axes(fig); hold(ax,'on'); axis(ax,'equal'); box(ax,'on');
+xlim(ax, [0 parkSize_km]);
+ylim(ax, [0 parkSize_km]);
+xlabel(ax, 'X (km)');
+ylabel(ax, 'Y (km)');
+title(ax, sprintf('Park Map: %d km × %d km (Grid = %.2f km)', parkSize_km, parkSize_km, gridSize_km));
+%% ====== DRAW PARK BORDER ======
+rectangle(ax, 'Position', [0 0 parkSize_km parkSize_km], ...
+   'EdgeColor', 'k', 'LineWidth', 2);
+%% ====== DRAW GRID ======
+if showGrid && gridSize_km > 0
+   for xg = 0:gridSize_km:parkSize_km
+       line(ax, [xg xg], [0 parkSize_km], 'LineWidth', 0.5, 'Color', [0.75 0.75 0.75]);
+   end
+   for yg = 0:gridSize_km:parkSize_km
+       line(ax, [0 parkSize_km], [yg yg], 'LineWidth', 0.5, 'Color', [0.75 0.75 0.75]);
+   end
+end
+%% ====== TICKS ======
+if showCellTicks && gridSize_km > 0
+   xticks(ax, 0:gridSize_km:parkSize_km);
+   yticks(ax, 0:gridSize_km:parkSize_km);
+else
+   xticks(ax, 0:5:parkSize_km);
+   yticks(ax, 0:5:parkSize_km);
+end
+set(ax, 'Color', [0.98 0.98 0.98]);
+plot(ax, 0, 0, 'ko', 'MarkerFaceColor','k');
+text(ax, 0.6, 0.6, '(0,0)', 'FontSize', 10, 'Color', 'k');
+grid(ax, 'off');
+%% ===============================
+%% STEP 2 — ZIGZAG REFERENCE PATH
+%% ===============================
+mode = "fire";          % "fire" (5x5) or "person" (3x3)
+overlapFactor = 1.0;    % 1.0 = step equals detection size; 0.5 = 50% overlap
+switch mode
+   case "fire"
+       detection_km = 5;
+   case "person"
+       detection_km = 3;
+   otherwise
+       error('mode must be "fire" or "person"');
+end
+zigzagStepY_km = detection_km * overlapFactor;
+% Make dx hit exactly 0..parkSize (avoid diagonal connectors)
+nStepsX = round(parkSize_km / gridSize_km);
+dx_km = parkSize_km / nStepsX;
+x_ref = [];
+y_ref = [];
+y = 0;
+goRight = true;
+while y <= parkSize_km
+   if goRight
+       x_line = 0:dx_km:parkSize_km;
+   else
+       x_line = parkSize_km:-dx_km:0;
+   end
+   y_line = y * ones(size(x_line));
+   x_ref = [x_ref, x_line];
+   y_ref = [y_ref, y_line];
+   y = y + zigzagStepY_km;
+   goRight = ~goRight;
+end
+valid = (x_ref >= 0 & x_ref <= parkSize_km & y_ref >= 0 & y_ref <= parkSize_km);
+x_ref = x_ref(valid);
+y_ref = y_ref(valid);
+plot(ax, x_ref, y_ref, 'b-', 'LineWidth', 1.8);
+plot(ax, x_ref(1), y_ref(1), 'go', 'MarkerFaceColor','g');
+plot(ax, x_ref(end), y_ref(end), 'ro', 'MarkerFaceColor','r');
+%% ===============================
+%% STEP 3 — DRONE MOTION BASE (time/logs/plots)
+%% ===============================
+dt = 15;                 % seconds (update interval)
+% Waypoint tracking settings
+wpTol_km = 0.2;           % reached waypoint tolerance (km)
+maxSteps = 200000;
+% Initial TRUE state
+x = x_ref(1);
+y = y_ref(1);
+i = 1;
+% Logs
+x_traj = zeros(1, maxSteps);
+y_traj = zeros(1, maxSteps);
+t_log  = zeros(1, maxSteps);
+%% ===============================
+%% STEP 4 — MEASUREMENT MODEL (GPS / BAD GPS / INTERNAL TRACKING)
+%% ===============================
+sigmaGPS_ok_km  = 0.01;   % ~10 m
+sigmaGPS_bad_km = 0.30;   % worse than tracking (>=0.25 km)
+trackMax_km     = 0.25;   % +/- 0.25 km
+badEvery_s      = 240;    % every 4 min
+badDuration_s   = 45;     % lasts 45 s
+dropEvery_s     = 900;    % every 15 min
+dropDuration_s  = 60;     % lasts 60 s
+x_meas_log = zeros(1, maxSteps);
+y_meas_log = zeros(1, maxSteps);
+%% ===============================
+%% STEP 5 — WIND DISTURBANCE MODEL
+%% ===============================
+A_wind_x_kmps = 0.010;   % 10 m/s
+A_wind_y_kmps = 0.006;   % 6 m/s
+T_wind_x_s = 180;        % 3 min
+T_wind_y_s = 240;        % 4 min
+% Reduced gusts for stability
+gustProb = 0.01;
+gustAmp_kmps = 0.006;    % 6 m/s
+gustDecay = 0.90;
+gust_x = 0;
+gust_y = 0;
+%% ===============================
+%% STEP 6 — CONTROLLER (PI)
+%% ===============================
+controllerType = "PI";
+Kp = 0.12;
+Ki = 0.0008;             % stable start for dt=15s
+Kd = 0.00;               % unused here
+Vmax_kmps = 0.015;        % 15 m/s speed limit
+% Integrator memory
+ex_int = 0; ey_int = 0;
+Imax_km = 2;              % integrator clamp
+%% ====== PLOTS ======
+dronePlot  = plot(ax, x, y, 'mo', 'MarkerFaceColor','m', 'MarkerSize', 6); % TRUE
+droneTrail = plot(ax, x, y, 'm-', 'LineWidth', 1);                         % TRUE trail
+measPlot   = plot(ax, x, y, 'ko', 'MarkerFaceColor','k', 'MarkerSize', 4); % MEAS
+modeText = text(ax, 1, parkSize_km-1.5, '', 'FontSize', 11, 'Color', 'k', 'FontWeight','bold');
+legend(ax, 'Park Border', 'Reference Path', 'Start', 'End', 'TRUE (drone)', 'TRUE trail', 'MEAS (sensor)', ...
+   'Location','northeastoutside');
+uistack(droneTrail, 'top');
+uistack(dronePlot, 'top');
+uistack(measPlot, 'top');
+%% ===============================
+%% MEASUREMENT FILTER (EMA low-pass)
+%% ===============================
+alpha = 0.25;   % 0.10 = very smooth, 0.40 = faster response (try 0.20–0.35)
+x_hat = x;      % filtered estimate start (use current true at start)
+y_hat = y;
+%% ---- Simulation loop ----
+k = 1;
+time_s = 0;
+while i <= length(x_ref) && k <= maxSteps
+   %% --- Current target waypoint ---
+   xt = x_ref(i);
+   yt = y_ref(i);
+   % Distance from TRUE position to waypoint (used only to switch waypoint)
+   dx = xt - x;
+   dy = yt - y;
+   dist = hypot(dx, dy);
+   if dist < wpTol_km
+       i = i + 1;
+       % reset integral when switching waypoint (prevents windup across waypoints)
+       ex_int = 0;
+       ey_int = 0;
+       continue;
+   end
+   %% ===============================
+   %% STEP 4: Determine measurement mode
+   %% ===============================
+   measMode = "GPS_OK";
+   if mod(time_s, badEvery_s) < badDuration_s
+       measMode = "GPS_BAD";
+   end
+   if mod(time_s, dropEvery_s) < dropDuration_s
+       measMode = "TRACKING";
+   end
+   %% ===============================
+   %% STEP 4: Generate measurement (x_meas, y_meas)
+   %% ===============================
+   switch measMode
+       case "GPS_OK"
+           ex_meas = sigmaGPS_ok_km  * randn();
+           ey_meas = sigmaGPS_ok_km  * randn();
+       case "GPS_BAD"
+           ex_meas = sigmaGPS_bad_km * randn();
+           ey_meas = sigmaGPS_bad_km * randn();
+           % Outliers removed for PI stability during tuning
+           % if rand < 0.10
+           %     ex_meas = ex_meas + (randn()*1.0);
+           %     ey_meas = ey_meas + (randn()*1.0);
+           % end
+       case "TRACKING"
+           ex_meas = (2*rand - 1) * trackMax_km;
+           ey_meas = (2*rand - 1) * trackMax_km;
+   end
+   x_meas = x + ex_meas;
+   y_meas = y + ey_meas;
+   % keep measurement within map (for plotting)
+   x_meas = min(max(x_meas, 0), parkSize_km);
+   y_meas = min(max(y_meas, 0), parkSize_km);
+   % Low-pass filter on measurement (EMA)
+   x_hat = alpha*x_meas + (1-alpha)*x_hat;
+   y_hat = alpha*y_meas + (1-alpha)*y_hat;
+   %% ===============================
+   %% STEP 6: PI CONTROL (uses MEASURED position)
+   %% ===============================
+   ex_ctrl = xt - x_meas;
+   ey_ctrl = yt - y_meas;
+   % Only integrate when measurement is reliable (avoid integrating noise)
+   if measMode == "GPS_OK"
+       ex_int = ex_int + ex_ctrl * dt;
+       ey_int = ey_int + ey_ctrl * dt;
+   end
+   % Clamp integrator (anti-windup)
+   ex_int = min(max(ex_int, -Imax_km), Imax_km);
+   ey_int = min(max(ey_int, -Imax_km), Imax_km);
+   % PI law
+   vx_cmd = Kp * ex_ctrl + Ki * ex_int;
+   vy_cmd = Kp * ey_ctrl + Ki * ey_int;
+   % saturate commanded speed
+   vmag = hypot(vx_cmd, vy_cmd);
+   if vmag > Vmax_kmps
+       vx_cmd = vx_cmd * (Vmax_kmps / vmag);
+       vy_cmd = vy_cmd * (Vmax_kmps / vmag);
+   end
+   %% ===============================
+   %% STEP 5: Wind disturbance (adds drift velocity)
+   %% ===============================
+   v_wind_x = A_wind_x_kmps * sin(2*pi*time_s / T_wind_x_s);
+   v_wind_y = A_wind_y_kmps * sin(2*pi*time_s / T_wind_y_s);
+   if rand < gustProb
+       gust_x = gust_x + gustAmp_kmps * (2*rand - 1);
+       gust_y = gust_y + gustAmp_kmps * (2*rand - 1);
+   end
+   gust_x = gustDecay * gust_x;
+   gust_y = gustDecay * gust_y;
+   vx = vx_cmd + v_wind_x + gust_x;
+   vy = vy_cmd + v_wind_y + gust_y;
+   %% ===============================
+   %% STEP 3: Update TRUE position
+   %% ===============================
+   x = x + vx * dt;
+   y = y + vy * dt;
+   x = min(max(x, 0), parkSize_km);
+   y = min(max(y, 0), parkSize_km);
+   %% --- Logs ---
+   x_traj(k) = x;
+   y_traj(k) = y;
+   t_log(k)  = time_s;
+   x_meas_log(k) = x_meas;
+   y_meas_log(k) = y_meas;
+   %% --- Plot update ---
+   if mod(k, 3) == 0
+       set(dronePlot, 'XData', x, 'YData', y);              % TRUE
+       set(measPlot,  'XData', x_meas, 'YData', y_meas);    % MEAS
+       set(droneTrail,'XData', x_traj(1:k), 'YData', y_traj(1:k));
+       set(modeText, 'String', "Mode: " + measMode + " | Ctrl: " + controllerType);
+       drawnow;
+   end
+   time_s = time_s + dt;
+   k = k + 1;
+end
+% Trim logs
+x_traj = x_traj(1:k-1);
+y_traj = y_traj(1:k-1);
+t_log  = t_log(1:k-1);
+x_meas_log = x_meas_log(1:k-1);
+y_meas_log = y_meas_log(1:k-1);
+fprintf('DONE (PI): simulated %.1f seconds (%.2f hours), reached waypoint index %d of %d.\n', ...
+   time_s, time_s/3600, min(i, length(x_ref)), length(x_ref));
+
+
+
+
